@@ -2,6 +2,7 @@ extends Node
 
 signal new_sse_event(headers, event, data)
 signal connected
+signal connection_error(error)
 
 const event_tag = "event:"
 const data_tag = "data:"
@@ -9,47 +10,77 @@ const data_tag = "data:"
 var httpclient = HTTPClient.new()
 var is_connected = false
 
+var domain
+var url_after_domain
+var port
+var use_ssl
+var verify_host
+var told_to_connect = false
+var connection_in_progress = false
+var request_in_progress = false
+var is_requested = false
+
 func connect_to_host(domain : String, url_after_domain : String, port : int = -1, use_ssl : bool = false, verify_host : bool = true):
-    var err = 0
-    err = httpclient.connect_to_host(domain, port, use_ssl, verify_host)
+    self.domain = domain
+    self.url_after_domain = url_after_domain
+    self.port = port
+    self.use_ssl = use_ssl
+    self.verify_host = verify_host
+    told_to_connect = true
 
-    while(httpclient.get_status() == HTTPClient.STATUS_CONNECTING or httpclient.get_status() == HTTPClient.STATUS_RESOLVING):
-        httpclient.poll()
-        var tree = get_tree()
-        if tree:
-            yield(get_tree().create_timer(0.1), "timeout")
-
-    err = httpclient.request(HTTPClient.METHOD_POST, url_after_domain, ["Accept: text/event-stream"])
+func attempt_to_connect():
+    var err = httpclient.connect_to_host(domain, port, use_ssl, verify_host)
     if err == OK:
         emit_signal("connected")
         is_connected = true
+    else:
+        emit_signal("connection_error", str(err))
+
+func attempt_to_request(httpclient_status):
+    if httpclient_status == HTTPClient.STATUS_CONNECTING or httpclient_status == HTTPClient.STATUS_RESOLVING:
+        return
+        
+    if httpclient_status == HTTPClient.STATUS_CONNECTED:
+        var err = httpclient.request(HTTPClient.METHOD_POST, url_after_domain, ["Accept: text/event-stream"])
+        if err == OK:
+            is_requested = true
 
 func _process(delta):
-    if !is_connected:
+    if !told_to_connect:
         return
-
-    while (httpclient.get_status() == HTTPClient.STATUS_REQUESTING):
-        httpclient.poll()
-        yield(get_tree().create_timer(0.1), "timeout")
-
+        
+    if !is_connected:
+        if !connection_in_progress:
+            attempt_to_connect()
+            connection_in_progress = true
+        return
+        
+    httpclient.poll()
+    var httpclient_status = httpclient.get_status()
+    if !is_requested:
+        if !request_in_progress:
+            attempt_to_request(httpclient_status)
+        return
+        
     var response_body = PoolByteArray()
 
-    if(httpclient.has_response()):
+    var httpclient_has_response = httpclient.has_response()
+        
+    if httpclient_has_response or httpclient_status == HTTPClient.STATUS_BODY:
         var headers = httpclient.get_response_headers_as_dictionary()
 
-        while(httpclient.get_status() == HTTPClient.STATUS_BODY):
-            httpclient.poll()
-            var chunk = httpclient.read_response_body_chunk()
-            if(chunk.size() == 0):
-                yield(get_tree().create_timer(0.1), "timeout")
-            else:
-                response_body = response_body + chunk
+        httpclient.poll()
+        var chunk = httpclient.read_response_body_chunk()
+        if(chunk.size() == 0):
+            yield(get_tree().create_timer(0.1), "timeout")
+        else:
+            response_body = response_body + chunk
 
-            var body = response_body.get_string_from_utf8()
-            if response_body.size() > 0:
-                response_body.resize(0)
-                var event_data = get_event_data(body)
-                emit_signal("new_sse_event", headers, event_data.event, event_data.data)
+        var body = response_body.get_string_from_utf8()
+        if response_body.size() > 0:
+            response_body.resize(0)
+            var event_data = get_event_data(body)
+            emit_signal("new_sse_event", headers, event_data.event, event_data.data)
 
 func get_event_data(body : String) -> Dictionary:
     var result = {}
